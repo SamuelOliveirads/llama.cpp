@@ -5423,6 +5423,59 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 class Qwen3_5TextModel(_LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        mtp_layers = self.hparams.get("mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            self.block_count = self.hparams["num_hidden_layers"] + mtp_layers
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        mtp_layers = self.hparams.get("mtp_num_hidden_layers", 0)
+        if mtp_layers > 0:
+            self.gguf_writer.add_nextn_predict_layers(mtp_layers)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Skip vision tensors - they belong in the mmproj file
+        if name.startswith("model.visual."):
+            return
+
+        if name.startswith("mtp."):
+            n_main = self.hparams["num_hidden_layers"]
+            mtp_bid = n_main  # first (and only) MTP block index
+
+            # Standard transformer block tensors inside mtp.layers.{i}.*
+            # Remap to model.layers.{n_main + i}.* so the parent chain handles them
+            # (applies norm +1 offset, tensor name mapping, etc.)
+            m = re.match(r"mtp\.layers\.(\d+)\.(.*)", name)
+            if m:
+                sub_bid = int(m.group(1))
+                rest = m.group(2)
+                new_name = f"model.layers.{n_main + sub_bid}.{rest}"
+                yield from super().modify_tensors(data_torch, new_name, n_main + sub_bid)
+                return
+
+            # Extra MTP-specific tensors (projection + norms outside the block)
+            # Norms are stored offset by -1 (same convention as main model norms)
+            if name == "mtp.pre_fc_norm_embedding.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_ENORM, mtp_bid), data_torch + 1)
+                return
+            if name == "mtp.pre_fc_norm_hidden.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_HNORM, mtp_bid), data_torch + 1)
+                return
+            if name == "mtp.fc.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, mtp_bid), data_torch)
+                return
+            if name == "mtp.norm.weight":
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, mtp_bid), data_torch + 1)
+                return
+
+            logger.warning(f"Unknown Qwen3.5 MTP tensor: {name!r}, skipping")
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
 class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
